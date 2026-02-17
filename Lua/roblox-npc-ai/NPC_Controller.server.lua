@@ -6,7 +6,9 @@ local Pathfinder = require(script.Parent.NPC_Pathfinder)
 local NPC_FOLDER = workspace:WaitForChild("NPCs")
 local ROAM_RADIUS = 60
 local AGGRO_CHECK_RATE = 0.2
-local CHASE_REPATH_RATE = 0.35
+local CHASE_REPATH_RATE = 0.8
+local CHASE_REPATH_DISTANCE = 3
+local ROAM_STUCK_SECONDS = 2
 
 local ANIMATION_IDS = {
 	Walk = "rbxassetid://129812663635239",
@@ -73,6 +75,11 @@ local brains = {}
 local npcAnimations = {}
 
 local function registerNpc(npc)
+	local root = npc:FindFirstChild("HumanoidRootPart")
+	if root then
+		root:SetNetworkOwner(nil)
+	end
+
 	brains[npc] = StateMachine.new(npc)
 end
 
@@ -117,15 +124,29 @@ while true do
 
 		if brain.State == "ROAM" and nearestPlayer and nearestDistance <= aggro then
 			brain:SetState("CHASE", nearestPlayer)
+			brain.CurrentRoamTarget = nil
+			brain.LastChaseRepath = nil
+			Pathfinder:Stop(npc)
 		end
 
 		if brain.State == "ROAM" then
 			humanoid.WalkSpeed = baseSpeed
 			if not brain.CurrentRoamTarget then
 				brain.CurrentRoamTarget = randomPointAround(root.Position, ROAM_RADIUS)
+				brain.LastRoamProgressAt = tick()
+				brain.LastRoamDistance = (root.Position - brain.CurrentRoamTarget).Magnitude
 				Pathfinder:MoveTo(npc, brain.CurrentRoamTarget)
-			elseif (root.Position - brain.CurrentRoamTarget).Magnitude < 2 then
-				brain.CurrentRoamTarget = nil
+			else
+				local remaining = (root.Position - brain.CurrentRoamTarget).Magnitude
+				if remaining < 2 then
+					brain.CurrentRoamTarget = nil
+				elseif not brain.LastRoamDistance or remaining < brain.LastRoamDistance - 1 then
+					brain.LastRoamDistance = remaining
+					brain.LastRoamProgressAt = tick()
+				elseif brain.LastRoamProgressAt and tick() - brain.LastRoamProgressAt >= ROAM_STUCK_SECONDS then
+					brain.CurrentRoamTarget = nil
+					Pathfinder:Stop(npc)
+				end
 			end
 			playTrack(brain, anims.Walk)
 
@@ -135,6 +156,7 @@ while true do
 			local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
 			if not targetRoot or not targetHumanoid or targetHumanoid.Health <= 0 then
 				brain:SetState("ROAM")
+				brain.CurrentRoamTarget = nil
 				Pathfinder:Stop(npc)
 				continue
 			end
@@ -156,7 +178,10 @@ while true do
 			humanoid.WalkSpeed = baseSpeed * alertMult
 			if not brain.LastChaseRepath or tick() - brain.LastChaseRepath >= CHASE_REPATH_RATE then
 				brain.LastChaseRepath = tick()
-				Pathfinder:MoveTo(npc, targetRoot.Position)
+				Pathfinder:MoveTo(npc, targetRoot.Position, {
+					minRepathTime = CHASE_REPATH_RATE,
+					minRepathDistance = CHASE_REPATH_DISTANCE,
+				})
 			end
 			playTrack(brain, anims.Run)
 
@@ -166,16 +191,19 @@ while true do
 			local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
 			if not targetRoot or not targetHumanoid or targetHumanoid.Health <= 0 then
 				brain:SetState("ROAM")
+				brain.CurrentRoamTarget = nil
 				continue
 			end
 
 			local distance = (targetRoot.Position - root.Position).Magnitude
 			if distance > attackRange then
 				brain:SetState("CHASE", target)
+				brain.LastChaseRepath = nil
 				continue
 			end
 
 			humanoid.WalkSpeed = 0
+			Pathfinder:Stop(npc)
 			playTrack(brain, anims.Attack)
 
 			if tick() - brain.LastAttack >= cooldown then

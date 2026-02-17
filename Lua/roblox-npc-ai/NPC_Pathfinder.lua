@@ -13,6 +13,25 @@ local function stopJob(model)
 	activeJobs[model] = nil
 end
 
+local function shouldSkipRepath(job, destination, now, minTime, minDistance)
+	if not job or not job.lastDestination then
+		return false
+	end
+
+	if minTime and minTime > 0 and now - (job.lastCompute or 0) < minTime then
+		return true
+	end
+
+	if minDistance and minDistance > 0 then
+		local moved = (job.lastDestination - destination).Magnitude
+		if moved < minDistance then
+			return true
+		end
+	end
+
+	return false
+end
+
 function Pathfinder:Stop(model)
 	stopJob(model)
 
@@ -22,19 +41,26 @@ function Pathfinder:Stop(model)
 	end
 end
 
-function Pathfinder:MoveTo(model, destination)
+function Pathfinder:MoveTo(model, destination, options)
 	local humanoid = model:FindFirstChildOfClass("Humanoid")
 	local root = model:FindFirstChild("HumanoidRootPart")
 	if not humanoid or not root then
 		return
 	end
 
+	options = options or {}
+	local now = tick()
+	local existingJob = activeJobs[model]
+	if shouldSkipRepath(existingJob, destination, now, options.minRepathTime, options.minRepathDistance) then
+		return
+	end
+
 	stopJob(model)
 
 	local path = PathfindingService:CreatePath({
-		AgentRadius = 2,
-		AgentHeight = 5,
-		AgentCanJump = true,
+		AgentRadius = options.agentRadius or 2,
+		AgentHeight = options.agentHeight or 5,
+		AgentCanJump = options.agentCanJump ~= false,
 	})
 
 	local ok = pcall(function()
@@ -51,7 +77,11 @@ function Pathfinder:MoveTo(model, destination)
 		return
 	end
 
-	local job = { cancelled = false }
+	local job = {
+		cancelled = false,
+		lastCompute = now,
+		lastDestination = destination,
+	}
 	activeJobs[model] = job
 
 	task.spawn(function()
@@ -66,6 +96,10 @@ function Pathfinder:MoveTo(model, destination)
 
 			humanoid:MoveTo(wp.Position)
 			local reached = humanoid.MoveToFinished:Wait()
+			if job.cancelled then
+				return
+			end
+
 			if not reached then
 				break
 			end

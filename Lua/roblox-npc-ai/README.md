@@ -25,3 +25,10 @@ This folder contains a cleaned-up version of your NPC AI scripts with fixes for 
 - In ServerScriptService, make sure module names match your `require` calls exactly:
   - `require(script.Parent.NPC_Pathfinder)` expects a ModuleScript named **NPC_Pathfinder**.
 - The animation IDs are placeholders from your original script. If an animation is not owned/allowed for the experience, Roblox will silently fail to play it.
+
+
+## Additional stability changes
+
+- Server network ownership enforced for NPC roots (`SetNetworkOwner(nil)`) to reduce client-side jolt/teleport effects during aggro/chase.
+- Chase repath now has both time and distance gates so NPCs do not constantly restart paths every frame.
+- Roam now includes stuck detection to reset a bad roam target if the NPC stops making progress.
