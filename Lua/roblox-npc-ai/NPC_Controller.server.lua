@@ -5,10 +5,12 @@ local Pathfinder = require(script.Parent.NPC_Pathfinder)
 
 local NPC_FOLDER = workspace:WaitForChild("NPCs")
 local ROAM_RADIUS = 60
+local ROAM_POINT_ATTEMPTS = 5
 local AGGRO_CHECK_RATE = 0.2
-local CHASE_REPATH_RATE = 0.8
-local CHASE_REPATH_DISTANCE = 3
+local CHASE_REPATH_RATE = 0.6
+local CHASE_REPATH_DISTANCE = 4
 local ROAM_STUCK_SECONDS = 2
+local SPEED_SMOOTH_ALPHA = 0.35
 
 local ANIMATION_IDS = {
 	Walk = "rbxassetid://129812663635239",
@@ -36,6 +38,16 @@ local function randomPointAround(position, radius)
 	local angle = math.random() * math.pi * 2
 	local distance = math.random() * radius
 	return position + Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance)
+end
+
+local function pickReachableRoamTarget(npc, origin, radius)
+	for _ = 1, ROAM_POINT_ATTEMPTS do
+		local candidate = randomPointAround(origin, radius)
+		if Pathfinder:CanPathTo(npc, candidate) then
+			return candidate
+		end
+	end
+	return randomPointAround(origin, radius)
 end
 
 local function loadAnimations(humanoid)
@@ -69,6 +81,10 @@ local function playTrack(brain, desiredTrack)
 
 	desiredTrack:Play(0.15)
 	brain.CurrentPlayingAnim = desiredTrack
+end
+
+local function smoothSetWalkSpeed(humanoid, desiredSpeed)
+	humanoid.WalkSpeed = humanoid.WalkSpeed + (desiredSpeed - humanoid.WalkSpeed) * SPEED_SMOOTH_ALPHA
 end
 
 local brains = {}
@@ -115,7 +131,8 @@ while true do
 
 		local aggro = npc:GetAttribute("AggroRange") or 30
 		local baseSpeed = npc:GetAttribute("WalkSpeedBase") or 10
-		local alertMult = npc:GetAttribute("AlertSpeedMult") or 1.6
+		local alertMult = npc:GetAttribute("AlertSpeedMult") or 1.4
+		local maxChaseSpeed = npc:GetAttribute("MaxChaseSpeed") or 14
 		local attackRange = npc:GetAttribute("AttackRange") or 4
 		local damage = npc:GetAttribute("Damage") or 10
 		local cooldown = npc:GetAttribute("AttackCooldown") or 1.2
@@ -130,12 +147,14 @@ while true do
 		end
 
 		if brain.State == "ROAM" then
-			humanoid.WalkSpeed = baseSpeed
+			smoothSetWalkSpeed(humanoid, baseSpeed)
 			if not brain.CurrentRoamTarget then
-				brain.CurrentRoamTarget = randomPointAround(root.Position, ROAM_RADIUS)
+				brain.CurrentRoamTarget = pickReachableRoamTarget(npc, root.Position, ROAM_RADIUS)
 				brain.LastRoamProgressAt = tick()
 				brain.LastRoamDistance = (root.Position - brain.CurrentRoamTarget).Magnitude
-				Pathfinder:MoveTo(npc, brain.CurrentRoamTarget)
+				Pathfinder:MoveTo(npc, brain.CurrentRoamTarget, {
+					waypointTimeout = 1.6,
+				})
 			else
 				local remaining = (root.Position - brain.CurrentRoamTarget).Magnitude
 				if remaining < 2 then
@@ -175,12 +194,14 @@ while true do
 				continue
 			end
 
-			humanoid.WalkSpeed = baseSpeed * alertMult
+			local desiredChaseSpeed = math.min(baseSpeed * alertMult, maxChaseSpeed)
+			smoothSetWalkSpeed(humanoid, desiredChaseSpeed)
 			if not brain.LastChaseRepath or tick() - brain.LastChaseRepath >= CHASE_REPATH_RATE then
 				brain.LastChaseRepath = tick()
 				Pathfinder:MoveTo(npc, targetRoot.Position, {
 					minRepathTime = CHASE_REPATH_RATE,
 					minRepathDistance = CHASE_REPATH_DISTANCE,
+					waypointTimeout = 1.0,
 				})
 			end
 			playTrack(brain, anims.Run)
@@ -202,7 +223,7 @@ while true do
 				continue
 			end
 
-			humanoid.WalkSpeed = 0
+			smoothSetWalkSpeed(humanoid, 0)
 			Pathfinder:Stop(npc)
 			playTrack(brain, anims.Attack)
 

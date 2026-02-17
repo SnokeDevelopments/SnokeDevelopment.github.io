@@ -32,6 +32,33 @@ local function shouldSkipRepath(job, destination, now, minTime, minDistance)
 	return false
 end
 
+local function createPath(options)
+	return PathfindingService:CreatePath({
+		AgentRadius = options.agentRadius or 2,
+		AgentHeight = options.agentHeight or 5,
+		AgentCanJump = options.agentCanJump ~= false,
+	})
+end
+
+function Pathfinder:CanPathTo(model, destination, options)
+	local root = model and model:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+
+	options = options or {}
+	local path = createPath(options)
+	local ok = pcall(function()
+		path:ComputeAsync(root.Position, destination)
+	end)
+
+	if not ok then
+		return false
+	end
+
+	return path.Status == Enum.PathStatus.Success
+end
+
 function Pathfinder:Stop(model)
 	stopJob(model)
 
@@ -57,12 +84,7 @@ function Pathfinder:MoveTo(model, destination, options)
 
 	stopJob(model)
 
-	local path = PathfindingService:CreatePath({
-		AgentRadius = options.agentRadius or 2,
-		AgentHeight = options.agentHeight or 5,
-		AgentCanJump = options.agentCanJump ~= false,
-	})
-
+	local path = createPath(options)
 	local ok = pcall(function()
 		path:ComputeAsync(root.Position, destination)
 	end)
@@ -85,9 +107,13 @@ function Pathfinder:MoveTo(model, destination, options)
 	activeJobs[model] = job
 
 	task.spawn(function()
-		for _, wp in ipairs(waypoints) do
+		for i, wp in ipairs(waypoints) do
 			if job.cancelled then
 				return
+			end
+
+			if i == 1 and (wp.Position - root.Position).Magnitude < 1.5 then
+				continue
 			end
 
 			if wp.Action == Enum.PathWaypointAction.Jump then
@@ -95,7 +121,7 @@ function Pathfinder:MoveTo(model, destination, options)
 			end
 
 			humanoid:MoveTo(wp.Position)
-			local reached = humanoid.MoveToFinished:Wait()
+			local reached = humanoid.MoveToFinished:Wait(options.waypointTimeout or 1.5)
 			if job.cancelled then
 				return
 			end

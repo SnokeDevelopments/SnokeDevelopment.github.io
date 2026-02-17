@@ -32,3 +32,7 @@ This folder contains a cleaned-up version of your NPC AI scripts with fixes for 
 - Server network ownership enforced for NPC roots (`SetNetworkOwner(nil)`) to reduce client-side jolt/teleport effects during aggro/chase.
 - Chase repath now has both time and distance gates so NPCs do not constantly restart paths every frame.
 - Roam now includes stuck detection to reset a bad roam target if the NPC stops making progress.
+
+- Roam target selection now tries several candidates and prefers path-reachable points to reduce wall-running/stuck behavior.
+- Chase speed is now capped (`MaxChaseSpeed`) and smoothed to prevent instant acceleration spikes that can look like lag/teleporting.
+- Waypoint traversal uses timeouts and skips near-zero first waypoints to reduce jitter at repath boundaries.
