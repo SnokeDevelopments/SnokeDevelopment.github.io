@@ -36,3 +36,10 @@ This folder contains a cleaned-up version of your NPC AI scripts with fixes for 
 - Roam target selection now tries several candidates and prefers path-reachable points to reduce wall-running/stuck behavior.
 - Chase speed is now capped (`MaxChaseSpeed`) and smoothed to prevent instant acceleration spikes that can look like lag/teleporting.
 - Waypoint traversal uses timeouts and skips near-zero first waypoints to reduce jitter at repath boundaries.
+
+## Latest behavior tuning
+
+- Added a dedicated **Idle** animation state during roaming pauses so NPCs pause and look less robotic between roam points.
+- Added roam pause windows and state-entry hooks to prevent ROAM/CHASE behavior overlap and improve movement smoothness.
+- Attack damage timing is now synchronized with animation via `AttackHitDelay` so the hit lands when the swing appears to connect.
+- Reduced chase speed spikes with lower default alert multiplier and hard cap (`MaxChaseSpeed`).
