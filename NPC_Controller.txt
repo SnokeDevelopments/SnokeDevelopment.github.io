@@ -1,0 +1,2369 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Debris = game:GetService("Debris")
+
+local StateMachine = require(script.Parent.NPC_StateMachine)
+local Patrol = require(script.Parent.NPC_Patrol)
+local WorldQuery = require(script.Parent.NPC_WorldQuery)
+
+local NPCDoorRequest = ReplicatedStorage:FindFirstChild("NPCDoorRequest")
+if not NPCDoorRequest then
+	NPCDoorRequest = Instance.new("BindableFunction")
+	NPCDoorRequest.Name = "NPCDoorRequest"
+	NPCDoorRequest.Parent = ReplicatedStorage
+end
+
+local PsychosisEvent = ReplicatedStorage:FindFirstChild("PsychosisEvent")
+if not PsychosisEvent then
+	PsychosisEvent = Instance.new("RemoteEvent")
+	PsychosisEvent.Name = "PsychosisEvent"
+	PsychosisEvent.Parent = ReplicatedStorage
+end
+
+local PsychosisSoundTemplate = ReplicatedStorage:FindFirstChild("PsychosisSound")
+
+local PsychosisNpcDamage = ReplicatedStorage:FindFirstChild("PsychosisNpcDamage")
+if not PsychosisNpcDamage then
+	PsychosisNpcDamage = Instance.new("RemoteEvent")
+	PsychosisNpcDamage.Name = "PsychosisNpcDamage"
+	PsychosisNpcDamage.Parent = ReplicatedStorage
+end
+
+local function resolvePathfinderModule()
+	local parent = script.Parent
+	local moduleScript = parent:FindFirstChild("NPC_Pathfinder") or parent:FindFirstChild("NPC_PathFinder")
+	if not moduleScript or not moduleScript:IsA("ModuleScript") then
+		error("NPC_Controller: Missing ModuleScript 'NPC_Pathfinder'/'NPC_PathFinder'")
+	end
+
+	local module = require(moduleScript)
+	if type(module) ~= "table" or type(module.MoveTo) ~= "function" or type(module.Stop) ~= "function" then
+		error("NPC_Controller: Pathfinder module missing MoveTo/Stop methods")
+	end
+
+	return module
+end
+
+local Pathfinder = resolvePathfinderModule()
+
+local NPC_FOLDER = workspace:WaitForChild("NPCs")
+local SPECIAL_NPC_FOLDER = workspace:FindFirstChild("SpecialNPCs") or workspace:WaitForChild("SpecialNPCs")
+local AIRLOCKS_FOLDER = workspace:WaitForChild("AirLocks")
+local CHASE_NODES_FOLDER = workspace:FindFirstChild("ChaseNodes")
+local ROOM_IDENTIFIERS_FOLDER = workspace:FindFirstChild("RoomIdentifiers")
+local ROOM_IGNORES_FOLDER = workspace:FindFirstChild("RoomIgnores")
+local SINGLE_DOORS_FOLDER = workspace:FindFirstChild("SingleDoors")
+local DOUBLE_DOORS_FOLDER = workspace:FindFirstChild("DoubleDoors")
+
+local AGGRO_CHECK_RATE = 0.1
+local CHASE_REPATH_RATE = 0.5
+local CHASE_REPATH_DISTANCE = 5
+local CHASE_FAR_REPATH_RATE = 0.9
+local CHASE_FAR_REPATH_DISTANCE = 8
+local CHASE_FAR_DISTANCE = 25
+local CHASE_DIRECT_ENTER = 16
+local CHASE_DIRECT_EXIT = 22
+local CHASE_DIRECT_REFRESH = 0.06
+local CHASE_MODE_LOCK_TIME = 0.2
+local CHASE_STEER_REFRESH = 0.08
+local CHASE_FAR_DIRECT_ENTER = 22
+local CHASE_FAR_DIRECT_EXIT = 18
+local ATTACK_ENTER_BUFFER = 1.5
+local ATTACK_EXIT_BUFFER = 2.5
+local ROAM_STUCK_SECONDS = 2
+local ROAM_PROGRESS_DELTA = 0.6
+local ROUTE_TARGET_REACHED = 3
+local ROUTE_PATH_ATTEMPTS = 2
+local ROUTE_MOVE_REFRESH = 0.75
+local ROUTE_NODE_HANDOFF_DISTANCE = 6
+local SPEED_SMOOTH_ALPHA = 0.35
+local FALLBACK_ROAM_RADIUS = 30
+local SPECIAL_ROAM_IDLE_MIN = 0.6
+local SPECIAL_ROAM_IDLE_MAX = 4
+local SPECIAL_SPAWN_EXIT_DISTANCE = 10
+local TARGET_LOST_GRACE = 0.8
+local CHASE_DROP_AGGRO_BUFFER = 1.15
+local CHASE_WRONG_WAY_DOT = -0.1
+local CHASE_WRONG_WAY_REPATH_COOLDOWN = 0.25
+local CHASE_PATH_PROGRESS_SAMPLE = 0.35
+local CHASE_PATH_PROGRESS_MIN = 0.75
+local AIRLOCK_TARGET_REACHED = 4
+local CHASE_NODE_DISTANCE = 45
+local CHASE_NODE_CAPTURE_RADIUS = 20
+local CHASE_NODE_TARGET_REACHED = 5
+local CHASE_LAST_KNOWN_REACHED = 6
+local CHASE_DOOR_OPEN_DISTANCE = 12
+local CHASE_DOOR_RETRY_COOLDOWN = 0.85
+local CHASE_DOOR_OPEN_TIME = 0.9
+
+local ANIMATION_IDS = {
+	Idle = "rbxassetid://115317428250703",
+	Walk = "rbxassetid://125574914282323",
+	Run = "rbxassetid://109387242126524",
+	Attack = "rbxassetid://127394215447965",
+	BrickStun = "rbxassetid://109558341266008",
+	StunLoop = "rbxassetid://109905139164172",
+}
+
+local INJURED_SFX_FOLDER = ReplicatedStorage:WaitForChild("InjuredSoundEffects")
+local STAB_SFX_TEMPLATE = ReplicatedStorage:WaitForChild("ZinxBlade")
+local CHASES_FOLDER = ReplicatedStorage:FindFirstChild("Chases")
+
+local VOICE_MIN_INTERVAL = 8
+local VOICE_MAX_INTERVAL = 18
+local VOICE_PLAY_CHANCE = 0.7
+local ALERT_VOICE_COOLDOWN = 4
+local VOICE_POST_COOLDOWN = 2.5
+local CHASE_MUSIC_BASE_VOLUME = 0.6
+local CHASE_MUSIC_FADE_RATE = 1.8
+local REECE_PSYCHOSIS_SECONDS = 15
+
+local npcVoiceState = {}
+local playerChaseAudio = {}
+local psychosisUntilByPlayer = {}
+local psychosisDamageCooldownByPlayer = {}
+
+local function getNpcVoiceFolder(npc)
+	local folder = npc:FindFirstChild("Voicelines")
+	if folder and folder:IsA("Folder") then
+		return folder
+	end
+	return nil
+end
+
+local function gatherVoiceSounds(folder)
+	local voices = {}
+	if not folder then
+		return voices
+	end
+
+	for _, child in ipairs(folder:GetChildren()) do
+		if child:IsA("Sound") and child.Name:match("^Voice") then
+			table.insert(voices, child)
+		end
+	end
+
+	return voices
+end
+
+local function canPlayVoiceNow(npc, now)
+	npcVoiceState[npc] = npcVoiceState[npc] or {}
+	local state = npcVoiceState[npc]
+	if state.currentVoice and state.currentVoice.Parent then
+		return false
+	end
+
+	local nextAllowed = state.nextVoiceAllowedAt or 0
+	return now >= nextAllowed
+end
+
+local function playNpcVoice(npc, soundObj, now)
+	if not npc or not soundObj then
+		return false
+	end
+
+	now = now or tick()
+	if not canPlayVoiceNow(npc, now) then
+		return false
+	end
+
+	local root = npc:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+
+	npcVoiceState[npc] = npcVoiceState[npc] or {}
+	local state = npcVoiceState[npc]
+
+	local clone = soundObj:Clone()
+	clone.Looped = false
+	clone.Parent = root
+	state.currentVoice = clone
+	clone:Play()
+
+	local postCooldown = tonumber(npc:GetAttribute("VoiceCooldown")) or VOICE_POST_COOLDOWN
+
+	local cleaned = false
+	local function cleanup()
+		if cleaned then
+			return
+		end
+		cleaned = true
+
+		if state.currentVoice == clone then
+			state.currentVoice = nil
+			state.nextVoiceAllowedAt = tick() + math.max(0, postCooldown)
+		end
+
+		if clone and clone.Parent then
+			clone:Destroy()
+		end
+	end
+
+	clone.Ended:Connect(cleanup)
+	clone.Stopped:Connect(cleanup)
+	Debris:AddItem(clone, math.max(2, (clone.TimeLength > 0 and clone.TimeLength + 1) or 8))
+	return true
+end
+
+local function scheduleNextVoice(npc, now)
+	local minInterval = tonumber(npc:GetAttribute("VoiceMinInterval")) or VOICE_MIN_INTERVAL
+	local maxInterval = tonumber(npc:GetAttribute("VoiceMaxInterval")) or VOICE_MAX_INTERVAL
+	if maxInterval < minInterval then
+		maxInterval = minInterval
+	end
+
+	local delay = minInterval
+	if maxInterval > minInterval then
+		delay = minInterval + math.random() * (maxInterval - minInterval)
+	end
+
+	npcVoiceState[npc] = npcVoiceState[npc] or {}
+	npcVoiceState[npc].nextVoiceAt = now + delay
+end
+
+local function tryPlayAmbientVoice(npc, brain, now)
+	if not npc or not brain then
+		return
+	end
+
+	if brain.State ~= "ROAM" then
+		return
+	end
+
+	npcVoiceState[npc] = npcVoiceState[npc] or {}
+	local state = npcVoiceState[npc]
+	if not state.nextVoiceAt then
+		scheduleNextVoice(npc, now)
+		return
+	end
+
+	if now < state.nextVoiceAt then
+		return
+	end
+
+	if not canPlayVoiceNow(npc, now) then
+		state.nextVoiceAt = math.max(state.nextVoiceAt or now, (state.nextVoiceAllowedAt or now) + 0.2)
+		return
+	end
+
+	scheduleNextVoice(npc, now)
+	if math.random() > (tonumber(npc:GetAttribute("VoicePlayChance")) or VOICE_PLAY_CHANCE) then
+		return
+	end
+
+	local folder = getNpcVoiceFolder(npc)
+	local voices = gatherVoiceSounds(folder)
+	if #voices == 0 then
+		return
+	end
+
+	playNpcVoice(npc, voices[math.random(1, #voices)], now)
+end
+
+local function playAlertVoice(npc, now)
+	npcVoiceState[npc] = npcVoiceState[npc] or {}
+	local state = npcVoiceState[npc]
+	local cooldown = tonumber(npc:GetAttribute("AlertVoiceCooldown")) or ALERT_VOICE_COOLDOWN
+	if state.lastAlertAt and now - state.lastAlertAt < cooldown then
+		return
+	end
+
+	local folder = getNpcVoiceFolder(npc)
+	local alert = folder and folder:FindFirstChild("AlertVoice")
+	if alert and alert:IsA("Sound") then
+		if playNpcVoice(npc, alert, now) then
+			state.lastAlertAt = now
+		end
+	end
+end
+
+local function getPlayerChaseSound(player)
+	if not player then
+		return nil
+	end
+
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then
+		return nil
+	end
+
+	local container = playerGui:FindFirstChild("NPCChaseAudio")
+	if not container then
+		container = Instance.new("Folder")
+		container.Name = "NPCChaseAudio"
+		container.Parent = playerGui
+	end
+
+	local sound = container:FindFirstChild("ActiveChase")
+	if not sound then
+		sound = Instance.new("Sound")
+		sound.Name = "ActiveChase"
+		sound.Looped = true
+		sound.Volume = 0
+		sound.Parent = container
+	end
+
+	return sound
+end
+
+local function getRandomChaseTemplate()
+	if not CHASES_FOLDER then
+		return nil
+	end
+
+	local candidates = {}
+	for _, child in ipairs(CHASES_FOLDER:GetChildren()) do
+		if child:IsA("Sound") then
+			table.insert(candidates, child)
+		end
+	end
+
+	if #candidates == 0 then
+		return nil
+	end
+
+	return candidates[math.random(1, #candidates)]
+end
+
+local function setPlayerChaseActive(player, isActive)
+	if not player then
+		return
+	end
+
+	playerChaseAudio[player] = playerChaseAudio[player] or { targetVolume = 0 }
+	local state = playerChaseAudio[player]
+	state.targetVolume = isActive and CHASE_MUSIC_BASE_VOLUME or 0
+
+	local sound = state.sound
+	if isActive then
+		sound = sound or getPlayerChaseSound(player)
+		if not sound then
+			return
+		end
+		state.sound = sound
+
+		if sound.SoundId == "" then
+			local template = getRandomChaseTemplate()
+			if template then
+				sound.SoundId = template.SoundId
+			end
+		end
+
+		if sound.SoundId ~= "" and not sound.IsPlaying then
+			sound:Play()
+		end
+	end
+end
+
+local function updatePlayerChaseAudio(deltaTime)
+	for player, state in pairs(playerChaseAudio) do
+		if not player.Parent then
+			playerChaseAudio[player] = nil
+			continue
+		end
+
+		state.sound = state.sound or getPlayerChaseSound(player)
+		local sound = state.sound
+		if not sound then
+			continue
+		end
+
+		local target = state.targetVolume or 0
+		local step = math.max(0.02, CHASE_MUSIC_FADE_RATE * deltaTime)
+		if sound.Volume < target then
+			sound.Volume = math.min(target, sound.Volume + step)
+		elseif sound.Volume > target then
+			sound.Volume = math.max(target, sound.Volume - step)
+		end
+
+		if target > 0 and sound.SoundId ~= "" and not sound.IsPlaying then
+			sound:Play()
+		elseif target <= 0 and sound.Volume <= 0.01 then
+			if sound.IsPlaying then
+				sound:Stop()
+			end
+			playerChaseAudio[player] = nil
+		end
+	end
+end
+
+local function normalizeAnimationId(value)
+	if typeof(value) == "number" then
+		return "rbxassetid://" .. tostring(math.floor(value))
+	end
+
+	if typeof(value) ~= "string" then
+		return nil
+	end
+
+	local trimmed = value:match("^%s*(.-)%s*$")
+	if not trimmed or trimmed == "" then
+		return nil
+	end
+
+	if trimmed:match("^rbxassetid://") then
+		return trimmed
+	end
+
+	if trimmed:match("^%d+$") then
+		return "rbxassetid://" .. trimmed
+	end
+
+	return trimmed
+end
+
+local function getFirstAnimationAttribute(npc, keys)
+	for _, key in ipairs(keys) do
+		local value = npc:GetAttribute(key)
+		local normalized = normalizeAnimationId(value)
+		if normalized then
+			return normalized
+		end
+	end
+	return nil
+end
+
+local function resolveAnimationIds(npc)
+	local ids = {
+		Idle = getFirstAnimationAttribute(npc, { "Anim_Idle", "Anim Idle", "IdleAnimationId" }) or ANIMATION_IDS.Idle,
+		Walk = getFirstAnimationAttribute(npc, { "Anim_Walk", "Anim Walk", "WalkAnimationId" }) or ANIMATION_IDS.Walk,
+		Run = getFirstAnimationAttribute(npc, { "Anim_Run", "Anim Run", "RunAnimationId" }) or ANIMATION_IDS.Run,
+		Attack = getFirstAnimationAttribute(npc, { "Anim_Attack", "Anim Attack", "AttackAnimationId", "AnimAttack" }) or ANIMATION_IDS.Attack,
+		BrickStun = getFirstAnimationAttribute(npc, { "BrickStunAnimationId" }) or ANIMATION_IDS.BrickStun,
+		StunLoop = getFirstAnimationAttribute(npc, { "StunLoopAnimationId" }) or ANIMATION_IDS.StunLoop,
+		Spray = getFirstAnimationAttribute(npc, { "Anim_Spray", "Anim Spray", "SprayAnimationId" }),
+	}
+
+	local doorOpenId = getFirstAnimationAttribute(npc, { "DoorOpenAnimationId" })
+	if doorOpenId then
+		ids.DoorOpen = doorOpenId
+	end
+
+	return ids
+end
+
+local function playOneShot(soundTemplate, parent, volumeScale)
+	if not soundTemplate or not parent then
+		return
+	end
+
+	local sound = soundTemplate:Clone()
+	sound.Parent = parent
+	if volumeScale then
+		sound.Volume = sound.Volume * volumeScale
+	end
+	sound:Play()
+	sound.Ended:Connect(function()
+		sound:Destroy()
+	end)
+end
+
+local function playHitSfx(character)
+	if not character then
+		return
+	end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return
+	end
+
+	local candidates = {}
+	for _, child in ipairs(INJURED_SFX_FOLDER:GetChildren()) do
+		if child:IsA("Sound") then
+			table.insert(candidates, child)
+		end
+	end
+
+	playOneShot(STAB_SFX_TEMPLATE, root, 0.9)
+	if #candidates > 0 then
+		local injuredTemplate = candidates[math.random(1, #candidates)]
+		playOneShot(injuredTemplate, root, 0.85)
+	end
+end
+
+local function getAttr(npc, ...)
+	for _, key in ipairs({ ... }) do
+		local value = npc:GetAttribute(key)
+		if value ~= nil then
+			return value
+		end
+	end
+	return nil
+end
+
+local function isSpecialNpc(npc)
+	return npc:GetAttribute("IsSpecialNPC") == true or npc.Parent == SPECIAL_NPC_FOLDER
+end
+
+
+local function isReeceSprayer(npc)
+	if not npc then
+		return false
+	end
+
+	if npc:GetAttribute("UseSprayGrab") == true then
+		return true
+	end
+
+	return isSpecialNpc(npc) and npc.Name == "Reece"
+end
+
+local function setReeceGasEnabled(npc, enabled)
+	if not npc then
+		return
+	end
+
+	local sprayer = npc:FindFirstChild("Sprayer", true)
+	local sprayPart = sprayer and sprayer:FindFirstChild("SprayPart")
+	local gas = sprayPart and sprayPart:FindFirstChild("Gas")
+	if gas and gas:IsA("ParticleEmitter") then
+		gas.Enabled = enabled == true
+	end
+end
+
+local function triggerPsychosis(character, duration)
+	if not character then
+		return
+	end
+
+	local player = Players:GetPlayerFromCharacter(character)
+	if not player then
+		return
+	end
+
+	duration = duration or REECE_PSYCHOSIS_SECONDS
+	psychosisUntilByPlayer[player] = math.max(psychosisUntilByPlayer[player] or 0, tick() + duration)
+	PsychosisEvent:FireClient(player, {
+		duration = duration,
+		intensity = tonumber(character:GetAttribute("PsychosisIntensity")) or 1,
+		soundId = PsychosisSoundTemplate and PsychosisSoundTemplate:IsA("Sound") and PsychosisSoundTemplate.SoundId or nil,
+		skinnerSpawnDistance = tonumber(character:GetAttribute("PsychosisNpcSpawnDistance")) or 24,
+		skinnerDamageRange = tonumber(character:GetAttribute("PsychosisNpcDamageRange")) or 6,
+		skinnerWalkSpeed = tonumber(character:GetAttribute("PsychosisNpcWalkSpeed")) or 9,
+		skinnerDamagePerSecond = tonumber(character:GetAttribute("PsychosisNpcDamagePerSecond")) or 4,
+	})
+end
+
+local function cleanupReeceSpray(npc, brain, applyDistortion)
+	if not brain then
+		return
+	end
+
+	setReeceGasEnabled(npc, false)
+
+	local victimHumanoid = brain.ReeceVictimHumanoid
+	local victimState = brain.ReeceVictimState
+	if victimHumanoid and victimHumanoid.Parent and victimState then
+		victimHumanoid.WalkSpeed = victimState.walkSpeed or victimHumanoid.WalkSpeed
+		victimHumanoid.AutoRotate = victimState.autoRotate ~= false
+		if victimState.useJumpPower then
+			victimHumanoid.JumpPower = victimState.jumpPower or victimHumanoid.JumpPower
+		else
+			victimHumanoid.JumpHeight = victimState.jumpHeight or victimHumanoid.JumpHeight
+		end
+
+		local victimRoot = victimHumanoid.Parent:FindFirstChild("HumanoidRootPart")
+		if victimRoot and victimState.rootAnchored ~= nil then
+			victimRoot.Anchored = victimState.rootAnchored == true
+		end
+
+		victimHumanoid.PlatformStand = victimState.platformStand == true
+		victimHumanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+
+	if applyDistortion and brain.ReeceVictimCharacter then
+		triggerPsychosis(brain.ReeceVictimCharacter, REECE_PSYCHOSIS_SECONDS)
+	end
+
+	brain.ReeceSprayActive = nil
+	brain.ReeceSprayStartsAt = nil
+	brain.ReeceSprayEndsAt = nil
+	brain.ReeceGasEnabled = nil
+	brain.ReeceVictimState = nil
+	brain.ReeceVictimHumanoid = nil
+	brain.ReeceVictimCharacter = nil
+	brain.ReeceSprayTrack = nil
+end
+
+local function pointInsidePart(position, part)
+	if not part then
+		return false
+	end
+
+	local localPoint = part.CFrame:PointToObjectSpace(position)
+	local half = part.Size * 0.5
+	return math.abs(localPoint.X) <= half.X
+		and math.abs(localPoint.Y) <= half.Y
+		and math.abs(localPoint.Z) <= half.Z
+end
+
+local function isDoorOpen(airlock)
+	if not airlock then
+		return false
+	end
+
+	for _, attrName in ipairs({ "DoorOpen", "IsOpen", "Open", "Opened" }) do
+		if airlock:GetAttribute(attrName) == true then
+			return true
+		end
+	end
+
+	for _, childName in ipairs({ "DoorOpen", "IsOpen", "Open", "Opened" }) do
+		local flag = airlock:FindFirstChild(childName)
+		if flag and flag:IsA("BoolValue") and flag.Value then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function hasLineOfSight(fromPosition, toPosition, npcModel, targetCharacter)
+	local ray = toPosition - fromPosition
+	if ray.Magnitude <= 0.05 then
+		return true
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	params.FilterDescendantsInstances = { npcModel, targetCharacter }
+
+	local hit = workspace:Raycast(fromPosition, ray, params)
+	if not hit then
+		return true
+	end
+
+	if targetCharacter and hit.Instance and hit.Instance:IsDescendantOf(targetCharacter) then
+		return true
+	end
+
+	return false
+end
+
+local function getRoomIgnoresFolder()
+	if ROOM_IGNORES_FOLDER and ROOM_IGNORES_FOLDER.Parent then
+		return ROOM_IGNORES_FOLDER
+	end
+
+	ROOM_IGNORES_FOLDER = workspace:FindFirstChild("RoomIgnores")
+	return ROOM_IGNORES_FOLDER
+end
+
+local function isPositionInsideRoomIgnore(position)
+	local folder = getRoomIgnoresFolder()
+	if not folder then
+		return false
+	end
+
+	for _, obj in ipairs(folder:GetDescendants()) do
+		if obj:IsA("BasePart") and pointInsidePart(position, obj) then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function isCharacterInsideRoomIgnore(character)
+	if not character then
+		return false
+	end
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+
+	return isPositionInsideRoomIgnore(root.Position)
+end
+
+local function getNearestPlayer(position)
+	local bestCharacter, bestDistance = nil, math.huge
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if root and humanoid and humanoid.Health > 0 and not isPositionInsideRoomIgnore(root.Position) then
+			local distance = (root.Position - position).Magnitude
+			if distance < bestDistance then
+				bestCharacter, bestDistance = character, distance
+			end
+		end
+	end
+	return bestCharacter, bestDistance
+end
+
+local function isLivePlayerCharacter(character)
+	if not character or not character.Parent then
+		return false
+	end
+
+	local player = Players:GetPlayerFromCharacter(character)
+	if not player or player.Character ~= character then
+		return false
+	end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root then
+		return false
+	end
+
+	return humanoid.Health > 0
+		and humanoid:GetState() ~= Enum.HumanoidStateType.Dead
+		and not isCharacterInsideRoomIgnore(character)
+end
+
+local function isTargetDeadOrStale(targetCharacter, targetHumanoid, targetRoot)
+	if not targetCharacter or not targetCharacter.Parent then
+		return true
+	end
+
+	if not targetHumanoid or not targetRoot then
+		return true
+	end
+
+	if targetHumanoid.Health <= 0 then
+		return true
+	end
+
+	if targetHumanoid:GetState() == Enum.HumanoidStateType.Dead then
+		return true
+	end
+
+	local ownerPlayer = Players:GetPlayerFromCharacter(targetCharacter)
+	if ownerPlayer and ownerPlayer.Character ~= targetCharacter then
+		return true
+	end
+
+	return false
+end
+
+local function randomPointAround(position, radius)
+	local angle = math.random() * math.pi * 2
+	local distance = math.random() * radius
+	return position + Vector3.new(math.cos(angle) * distance, 0, math.sin(angle) * distance)
+end
+
+local function randomIdlePauseUntil(npc)
+	local minIdle = SPECIAL_ROAM_IDLE_MIN
+	local maxIdle = SPECIAL_ROAM_IDLE_MAX
+	if not npc or not isSpecialNpc(npc) then
+		return nil
+	end
+	if maxIdle <= 0 then
+		return nil
+	end
+	if maxIdle <= minIdle then
+		return tick() + maxIdle
+	end
+	return tick() + math.random() * (maxIdle - minIdle) + minIdle
+end
+
+local function loadAnimations(npc, humanoid)
+	local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator")
+	animator.Parent = humanoid
+
+	local tracks = {}
+	local ids = resolveAnimationIds(npc)
+	for name, id in pairs(ids) do
+		local animation = Instance.new("Animation")
+		animation.AnimationId = id
+		local track = animator:LoadAnimation(animation)
+		if name == "Attack" or name == "Spray" or name == "BrickStun" or name == "StunLoop" or name == "DoorOpen" then
+			track.Priority = Enum.AnimationPriority.Action
+		elseif name == "Idle" then
+			track.Priority = Enum.AnimationPriority.Idle
+		else
+			track.Priority = Enum.AnimationPriority.Movement
+		end
+		tracks[name] = track
+	end
+
+	return tracks
+end
+
+local function animationSignature(npc)
+	local keys = {
+		"Anim_Idle", "Anim Idle", "IdleAnimationId",
+		"Anim_Walk", "Anim Walk", "WalkAnimationId",
+		"Anim_Run", "Anim Run", "RunAnimationId",
+		"Anim_Attack", "Anim Attack", "AnimAttack", "AttackAnimationId",
+		"Anim_Spray", "Anim Spray", "SprayAnimationId",
+		"BrickStunAnimationId", "StunLoopAnimationId", "DoorOpenAnimationId",
+	}
+
+	local parts = {}
+	for _, key in ipairs(keys) do
+		local value = npc:GetAttribute(key)
+		table.insert(parts, key .. "=" .. tostring(value))
+	end
+
+	return table.concat(parts, "|")
+end
+
+local function stopAllTracks(trackSet)
+	if not trackSet then
+		return
+	end
+
+	for _, track in pairs(trackSet) do
+		if track and track.IsPlaying then
+			track:Stop(0.05)
+		end
+	end
+end
+
+local function playTrack(brain, desiredTrack)
+	if brain.CurrentPlayingAnim == desiredTrack then
+		return
+	end
+
+	if brain.CurrentPlayingAnim then
+		brain.CurrentPlayingAnim:Stop(0.1)
+	end
+
+	desiredTrack:Play(0.1)
+	brain.CurrentPlayingAnim = desiredTrack
+end
+
+local function smoothSetWalkSpeed(humanoid, desiredSpeed)
+	humanoid.WalkSpeed = humanoid.WalkSpeed + (desiredSpeed - humanoid.WalkSpeed) * SPEED_SMOOTH_ALPHA
+end
+
+local function getSpecialRoamRegion(rootPosition)
+	local nearestPlayer = getNearestPlayer(rootPosition)
+	if nearestPlayer then
+		local playerRoot = nearestPlayer:FindFirstChild("HumanoidRootPart")
+		if playerRoot then
+			return WorldQuery:GetRegionInfo(playerRoot.Position).Part
+		end
+	end
+	return WorldQuery:GetRegionInfo(rootPosition).Part
+end
+
+local function pickRoamTargetInRegion(npc, rootPosition, regionPart)
+	if regionPart then
+		for _ = 1, ROUTE_PATH_ATTEMPTS do
+			local candidate = WorldQuery:GetRandomPointInRegion(regionPart)
+			if candidate and Pathfinder:CanPathTo(npc, candidate) then
+				return candidate
+			end
+		end
+	end
+
+	for _ = 1, ROUTE_PATH_ATTEMPTS do
+		local fallback = randomPointAround(rootPosition, FALLBACK_ROAM_RADIUS)
+		if Pathfinder:CanPathTo(npc, fallback) then
+			return fallback
+		end
+	end
+
+	return randomPointAround(rootPosition, FALLBACK_ROAM_RADIUS)
+end
+
+local function pickSpecialRoamTarget(npc, brain, rootPosition)
+	local nearestPlayer = getNearestPlayer(rootPosition)
+	local targetRegion = nil
+	if nearestPlayer then
+		local playerRoot = nearestPlayer:FindFirstChild("HumanoidRootPart")
+		if playerRoot then
+			targetRegion = WorldQuery:GetRegionInfo(playerRoot.Position).Part
+		end
+	end
+
+	local candidates = {}
+	for _, point in ipairs(WorldQuery:GetInterestPoints()) do
+		local inTargetRegion = true
+		if targetRegion then
+			inTargetRegion = WorldQuery:IsInRegion(point.Position, targetRegion)
+		end
+		if inTargetRegion then
+			table.insert(candidates, point)
+		end
+	end
+
+	if #candidates > 0 then
+		table.sort(candidates, function(a, b)
+			return (a.Position - rootPosition).Magnitude < (b.Position - rootPosition).Magnitude
+		end)
+
+		local pickCount = math.min(#candidates, 4)
+		local filtered = {}
+		for i = 1, pickCount do
+			if candidates[i].Name ~= brain.LastSpecialInterestName then
+				table.insert(filtered, candidates[i])
+			end
+		end
+		if #filtered == 0 then
+			filtered = candidates
+		end
+
+		local selected = filtered[math.random(1, math.min(#filtered, pickCount))]
+		if selected then
+			brain.LastSpecialInterestName = selected.Name
+			local around = selected.Position + Vector3.new(math.random(-9, 9), 0, math.random(-9, 9))
+			if Pathfinder:CanPathTo(npc, around) then
+				return around
+			end
+		end
+	end
+
+	if targetRegion then
+		return pickRoamTargetInRegion(npc, rootPosition, targetRegion)
+	end
+	return pickRoamTargetInRegion(npc, rootPosition, WorldQuery:GetRegionInfo(rootPosition).Part)
+end
+
+local function findNearestAirlock(position)
+	local bestAirlock, bestDist = nil, math.huge
+	for _, airlock in ipairs(AIRLOCKS_FOLDER:GetChildren()) do
+		local marker = airlock:FindFirstChild("SpecialNPCSpawn")
+		if marker and marker:IsA("BasePart") then
+			local dist = (marker.Position - position).Magnitude
+			if dist < bestDist then
+				bestDist = dist
+				bestAirlock = airlock
+			end
+		end
+	end
+	return bestAirlock
+end
+
+local function findAirlockByName(airlockName)
+	if not airlockName then
+		return nil
+	end
+	for _, airlock in ipairs(AIRLOCKS_FOLDER:GetChildren()) do
+		if airlock.Name == airlockName then
+			return airlock
+		end
+	end
+	return nil
+end
+
+local doorByIdCache = {}
+local doorCacheBuilt = false
+local chaseDoorCache = {
+	dirty = true,
+	doors = {},
+}
+
+local function rebuildDoorCache()
+	table.clear(doorByIdCache)
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") then
+			local id = obj:GetAttribute("DoorId")
+			if typeof(id) == "string" and id ~= "" and not doorByIdCache[id] then
+				doorByIdCache[id] = obj
+			end
+		end
+	end
+	doorCacheBuilt = true
+end
+
+local function markChaseDoorCacheDirty()
+	chaseDoorCache.dirty = true
+end
+
+workspace.DescendantAdded:Connect(function(obj)
+	if obj:IsA("Model") and obj:GetAttribute("DoorId") then
+		doorCacheBuilt = false
+	end
+	if obj:IsA("Model") and (obj:GetAttribute("ConnectionA") or obj:GetAttribute("ConnectionB")) then
+		markChaseDoorCacheDirty()
+	elseif obj.Name == "SingleDoors" then
+		SINGLE_DOORS_FOLDER = obj
+		markChaseDoorCacheDirty()
+	elseif obj.Name == "DoubleDoors" then
+		DOUBLE_DOORS_FOLDER = obj
+		markChaseDoorCacheDirty()
+	elseif obj.Name == "RoomIdentifiers" then
+		ROOM_IDENTIFIERS_FOLDER = obj
+	end
+end)
+
+workspace.DescendantRemoving:Connect(function(obj)
+	if obj:IsA("Model") and obj:GetAttribute("DoorId") then
+		doorCacheBuilt = false
+	end
+	if obj:IsA("Model") and (obj:GetAttribute("ConnectionA") or obj:GetAttribute("ConnectionB")) then
+		markChaseDoorCacheDirty()
+	elseif obj == SINGLE_DOORS_FOLDER or obj.Name == "SingleDoors" then
+		SINGLE_DOORS_FOLDER = nil
+		markChaseDoorCacheDirty()
+	elseif obj == DOUBLE_DOORS_FOLDER or obj.Name == "DoubleDoors" then
+		DOUBLE_DOORS_FOLDER = nil
+		markChaseDoorCacheDirty()
+	elseif obj == ROOM_IDENTIFIERS_FOLDER or obj.Name == "RoomIdentifiers" then
+		ROOM_IDENTIFIERS_FOLDER = nil
+	end
+end)
+
+local function getRoomIdentifiersFolder()
+	if ROOM_IDENTIFIERS_FOLDER and ROOM_IDENTIFIERS_FOLDER.Parent then
+		return ROOM_IDENTIFIERS_FOLDER
+	end
+
+	ROOM_IDENTIFIERS_FOLDER = workspace:FindFirstChild("RoomIdentifiers")
+	return ROOM_IDENTIFIERS_FOLDER
+end
+
+local function getContainingRoomIdentifier(position)
+	local folder = getRoomIdentifiersFolder()
+	if not folder then
+		return nil
+	end
+
+	for _, part in ipairs(folder:GetChildren()) do
+		if part:IsA("BasePart") and pointInsidePart(position, part) then
+			return part
+		end
+	end
+
+	return nil
+end
+
+local function getDoorAnchorPart(doorModel)
+	if not doorModel then
+		return nil
+	end
+
+	local hinge = doorModel:FindFirstChild("Hinge")
+	if hinge and hinge:IsA("BasePart") then
+		return hinge
+	end
+
+	if doorModel.PrimaryPart then
+		return doorModel.PrimaryPart
+	end
+
+	return doorModel:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getDoorConnectionValue(doorModel, attrName)
+	local value = doorModel:GetAttribute(attrName)
+	if typeof(value) ~= "string" or value == "" then
+		return nil
+	end
+
+	return value
+end
+
+local function rebuildChaseDoorCache()
+	table.clear(chaseDoorCache.doors)
+
+	local containers = {}
+	if SINGLE_DOORS_FOLDER and SINGLE_DOORS_FOLDER.Parent then
+		table.insert(containers, SINGLE_DOORS_FOLDER)
+	end
+	if DOUBLE_DOORS_FOLDER and DOUBLE_DOORS_FOLDER.Parent then
+		table.insert(containers, DOUBLE_DOORS_FOLDER)
+	end
+
+	for _, container in ipairs(containers) do
+		for _, obj in ipairs(container:GetDescendants()) do
+			if obj:IsA("Model") then
+				local connectionA = getDoorConnectionValue(obj, "ConnectionA")
+				local connectionB = getDoorConnectionValue(obj, "ConnectionB")
+				if connectionA and connectionB then
+					local anchor = getDoorAnchorPart(obj)
+					if anchor then
+						table.insert(chaseDoorCache.doors, {
+							Model = obj,
+							Anchor = anchor,
+							ConnectionA = connectionA,
+							ConnectionB = connectionB,
+						})
+					end
+				end
+			end
+		end
+	end
+
+	chaseDoorCache.dirty = false
+end
+
+local function getEligibleChaseDoors()
+	if chaseDoorCache.dirty then
+		rebuildChaseDoorCache()
+	end
+
+	return chaseDoorCache.doors
+end
+
+local function getOppositeRoomName(doorInfo, roomName)
+	if not doorInfo or not roomName then
+		return nil
+	end
+
+	if doorInfo.ConnectionA == roomName then
+		return doorInfo.ConnectionB
+	elseif doorInfo.ConnectionB == roomName then
+		return doorInfo.ConnectionA
+	end
+
+	return nil
+end
+
+local function findChaseDoorBetweenRooms(fromPosition, targetPosition)
+	local fromRoom = getContainingRoomIdentifier(fromPosition)
+	local targetRoom = getContainingRoomIdentifier(targetPosition)
+	if not fromRoom or not targetRoom or fromRoom == targetRoom then
+		return nil
+	end
+
+	local fromRoomName = fromRoom.Name
+	local targetRoomName = targetRoom.Name
+	local bestDoor, bestDistance = nil, math.huge
+	for _, doorInfo in ipairs(getEligibleChaseDoors()) do
+		local oppositeRoom = getOppositeRoomName(doorInfo, fromRoomName)
+		if oppositeRoom == targetRoomName and doorInfo.Anchor and doorInfo.Anchor.Parent and doorInfo.Model and doorInfo.Model.Parent then
+			local distance = (doorInfo.Anchor.Position - fromPosition).Magnitude
+			if distance < bestDistance then
+				bestDoor = doorInfo
+				bestDistance = distance
+			end
+		end
+	end
+
+	return bestDoor, bestDistance
+end
+
+local function tryOpenChaseDoor(npc, brain, targetPosition)
+	if not npc or not brain or not targetPosition then
+		return false
+	end
+
+	local root = npc:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false
+	end
+
+	local doorInfo, doorDistance = findChaseDoorBetweenRooms(root.Position, targetPosition)
+	if not doorInfo or doorDistance > CHASE_DOOR_OPEN_DISTANCE then
+		return false
+	end
+
+	local now = tick()
+	if brain.LastChaseDoor == doorInfo.Model and brain.LastChaseDoorAt and now - brain.LastChaseDoorAt < CHASE_DOOR_RETRY_COOLDOWN then
+		return false
+	end
+
+	brain.LastChaseDoor = doorInfo.Model
+	brain.LastChaseDoorAt = now
+
+	local ok, opened = pcall(function()
+		return NPCDoorRequest:Invoke(doorInfo.Model, npc, false, CHASE_DOOR_OPEN_TIME)
+	end)
+
+	return ok and opened == true
+end
+
+local function findDoorById(doorId)
+	if typeof(doorId) ~= "string" or doorId == "" then
+		return nil
+	end
+
+	if not doorCacheBuilt then
+		rebuildDoorCache()
+	end
+
+	local cached = doorByIdCache[doorId]
+	if cached and cached.Parent then
+		return cached
+	end
+
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("Model") and obj:GetAttribute("DoorId") == doorId then
+			doorByIdCache[doorId] = obj
+			return obj
+		end
+	end
+
+	doorByIdCache[doorId] = nil
+	return nil
+end
+
+local chaseNodeCache = {
+	dirty = true,
+	nodes = {},
+}
+
+local function extractTrailingNumber(name)
+	local value = string.match(name or "", "(%d+)$")
+	return tonumber(value)
+end
+
+local function getChaseNodesFolder()
+	if CHASE_NODES_FOLDER and CHASE_NODES_FOLDER.Parent then
+		return CHASE_NODES_FOLDER
+	end
+
+	CHASE_NODES_FOLDER = workspace:FindFirstChild("ChaseNodes")
+	return CHASE_NODES_FOLDER
+end
+
+local function markChaseNodeCacheDirty()
+	chaseNodeCache.dirty = true
+end
+
+workspace.ChildAdded:Connect(function(child)
+	if child.Name == "ChaseNodes" then
+		CHASE_NODES_FOLDER = child
+		markChaseNodeCacheDirty()
+	end
+end)
+
+workspace.ChildRemoved:Connect(function(child)
+	if child == CHASE_NODES_FOLDER or child.Name == "ChaseNodes" then
+		CHASE_NODES_FOLDER = nil
+		markChaseNodeCacheDirty()
+	end
+end)
+
+workspace.DescendantAdded:Connect(function(obj)
+	local folder = getChaseNodesFolder()
+	if obj == folder or (folder and obj.Parent == folder) then
+		markChaseNodeCacheDirty()
+	end
+end)
+
+workspace.DescendantRemoving:Connect(function(obj)
+	local folder = CHASE_NODES_FOLDER
+	if obj == folder or (folder and obj.Parent == folder) then
+		markChaseNodeCacheDirty()
+	end
+end)
+
+local function rebuildChaseNodeCache()
+	local folder = getChaseNodesFolder()
+	local ordered = {}
+
+	if folder then
+		for _, child in ipairs(folder:GetChildren()) do
+			local part = nil
+			if child:IsA("BasePart") then
+				part = child
+			elseif child:IsA("Model") then
+				part = child.PrimaryPart
+			end
+
+			local order = extractTrailingNumber(child.Name)
+			if part and order then
+				table.insert(ordered, {
+					Order = order,
+					Part = part,
+				})
+			end
+		end
+	end
+
+	table.sort(ordered, function(a, b)
+		if a.Order == b.Order then
+			return a.Part.Name < b.Part.Name
+		end
+		return a.Order < b.Order
+	end)
+
+	chaseNodeCache.nodes = ordered
+	chaseNodeCache.dirty = false
+	return chaseNodeCache.nodes
+end
+
+local function getOrderedChaseNodes()
+	if chaseNodeCache.dirty then
+		return rebuildChaseNodeCache()
+	end
+	return chaseNodeCache.nodes
+end
+
+local function getNearestChaseNode(position, maxDistance)
+	local bestEntry, bestIndex, bestDistance = nil, nil, math.huge
+	for index, entry in ipairs(getOrderedChaseNodes()) do
+		local part = entry.Part
+		if part and part.Parent then
+			local distance = (part.Position - position).Magnitude
+			if distance < bestDistance then
+				bestEntry = entry
+				bestIndex = index
+				bestDistance = distance
+			end
+		end
+	end
+
+	if not bestEntry then
+		return nil, nil, math.huge
+	end
+
+	if maxDistance and bestDistance > maxDistance then
+		return nil, nil, bestDistance
+	end
+
+	return bestEntry, bestIndex, bestDistance
+end
+
+local function buildCircularNodePath(startIndex, endIndex)
+	local nodeCount = #getOrderedChaseNodes()
+	if nodeCount == 0 or not startIndex or not endIndex then
+		return nil
+	end
+
+	local forwardPath = {}
+	local index = startIndex
+	while true do
+		table.insert(forwardPath, index)
+		if index == endIndex then
+			break
+		end
+		index = (index % nodeCount) + 1
+	end
+
+	local backwardPath = {}
+	index = startIndex
+	while true do
+		table.insert(backwardPath, index)
+		if index == endIndex then
+			break
+		end
+		index = ((index - 2) % nodeCount) + 1
+	end
+
+	if #backwardPath < #forwardPath then
+		return backwardPath
+	end
+
+	return forwardPath
+end
+
+local function clearChaseNodePlan(brain)
+	brain.ChaseNodePath = nil
+	brain.ChaseNodePathIndex = nil
+	brain.ChaseNodeGoalIndex = nil
+	brain.ChaseNodeGoalPosition = nil
+end
+
+local function updateChaseNodeProgress(brain, rootPosition, nodeReachedDistance)
+	while brain.ChaseNodePath and brain.ChaseNodePathIndex and brain.ChaseNodePathIndex <= #brain.ChaseNodePath do
+		local entry = getOrderedChaseNodes()[brain.ChaseNodePath[brain.ChaseNodePathIndex]]
+		if not entry or not entry.Part or not entry.Part.Parent then
+			clearChaseNodePlan(brain)
+			return
+		end
+
+		if (entry.Part.Position - rootPosition).Magnitude <= nodeReachedDistance then
+			brain.ChaseNodePathIndex += 1
+		else
+			break
+		end
+	end
+end
+
+local function refreshChaseNodePlan(brain, rootPosition, goalPosition, nodeCaptureRadius, nodeReachedDistance)
+	local _, startIndex = getNearestChaseNode(rootPosition)
+	local _, goalIndex = getNearestChaseNode(goalPosition, nodeCaptureRadius)
+	if not startIndex or not goalIndex then
+		clearChaseNodePlan(brain)
+		return false
+	end
+
+	local shouldRebuild = brain.ChaseNodeGoalIndex ~= goalIndex
+		or not brain.ChaseNodeGoalPosition
+		or (brain.ChaseNodeGoalPosition - goalPosition).Magnitude >= CHASE_REPATH_DISTANCE
+		or not brain.ChaseNodePath
+		or brain.ChaseNodePathIndex == nil
+		or brain.ChaseNodePathIndex > #brain.ChaseNodePath
+
+	if shouldRebuild then
+		brain.ChaseNodePath = buildCircularNodePath(startIndex, goalIndex)
+		brain.ChaseNodePathIndex = 1
+		brain.ChaseNodeGoalIndex = goalIndex
+		brain.ChaseNodeGoalPosition = goalPosition
+	end
+
+	updateChaseNodeProgress(brain, rootPosition, nodeReachedDistance)
+	return brain.ChaseNodePath ~= nil
+end
+
+local function getChaseMoveTarget(brain, rootPosition, goalPosition, nodeReachedDistance)
+	updateChaseNodeProgress(brain, rootPosition, nodeReachedDistance)
+
+	if brain.ChaseNodePath and brain.ChaseNodePathIndex and brain.ChaseNodePathIndex <= #brain.ChaseNodePath then
+		local entry = getOrderedChaseNodes()[brain.ChaseNodePath[brain.ChaseNodePathIndex]]
+		if entry and entry.Part and entry.Part.Parent then
+			return entry.Part.Position, true
+		end
+	end
+
+	clearChaseNodePlan(brain)
+	return goalPosition, false
+end
+
+local brains = {}
+local npcAnimations = {}
+local npcAnimationSignatures = {}
+
+PsychosisNpcDamage.OnServerEvent:Connect(function(player, payload)
+	local activeUntil = psychosisUntilByPlayer[player] or 0
+	if tick() > activeUntil then
+		return
+	end
+
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+
+	if type(payload) ~= "table" or payload.inRange ~= true then
+		return
+	end
+
+	local now = tick()
+	local nextAllowed = psychosisDamageCooldownByPlayer[player] or 0
+	if now < nextAllowed then
+		return
+	end
+
+	local dt = math.clamp(tonumber(payload.dt) or 0.2, 0.05, 0.4)
+	local damagePerSecond = math.max(0, tonumber(payload.damagePerSecond) or 4)
+	local damage = damagePerSecond * dt
+	if damage > 0 then
+		humanoid:TakeDamage(damage)
+	end
+
+	psychosisDamageCooldownByPlayer[player] = now + 0.1
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	playerChaseAudio[player] = nil
+	psychosisUntilByPlayer[player] = nil
+	psychosisDamageCooldownByPlayer[player] = nil
+end)
+
+local function resetRouteState(brain)
+	brain.RoutePoints = nil
+	brain.RouteName = nil
+	brain.RouteIndex = nil
+	brain.RouteDirection = 1
+	brain.RouteHoldUntil = nil
+	brain.RouteLastTarget = nil
+	brain.LastRoamDistance = nil
+	brain.LastRoamProgressAt = nil
+	brain.RouteDoorNode = nil
+	clearChaseNodePlan(brain)
+	brain.LastSeenTargetAt = nil
+	brain.LastKnownTargetPos = nil
+end
+
+local function onStateEntered(npc, brain, newState)
+	if newState == "ROAM" then
+		cleanupReeceSpray(npc, brain, false)
+		Pathfinder:Stop(npc)
+		local humanoid = npc:FindFirstChildOfClass("Humanoid")
+		local root = npc:FindFirstChild("HumanoidRootPart")
+		if humanoid and root then
+			humanoid:MoveTo(root.Position)
+		end
+		brain.RoamTarget = nil
+		brain.LastRoamDistance = nil
+		brain.LastRoamProgressAt = nil
+		brain.LastChaseTargetPos = nil
+		brain.TargetLostAt = nil
+		brain.LostTargetAt = nil
+		brain.LastSeenTargetAt = nil
+		brain.LastKnownTargetPos = nil
+		clearChaseNodePlan(brain)
+		brain.RouteHoldUntil = nil
+		brain.RouteLastTarget = nil
+		brain.RouteLastMoveAt = nil
+		brain.LastChaseDoor = nil
+		brain.LastChaseDoorAt = nil
+		if isSpecialNpc(npc) then
+			brain.RoamPauseUntil = randomIdlePauseUntil(npc)
+		end
+	elseif newState == "CHASE" then
+		cleanupReeceSpray(npc, brain, false)
+		Pathfinder:Stop(npc)
+		brain.LastChaseRepath = nil
+		brain.LastChaseTargetPos = nil
+		brain.LastDirectMoveAt = nil
+		brain.LastChaseSteerAt = nil
+		brain.ChaseMode = nil
+		brain.LastChaseModeSwitchAt = tick()
+		brain.FarDirectLock = false
+		brain.LastWrongWayRepathAt = nil
+		brain.LastPathStuckAt = nil
+		brain.LastPathSamplePos = nil
+		brain.LastPathSampleAt = nil
+		brain.LostTargetAt = nil
+		brain.LastSeenTargetAt = tick()
+		brain.LastKnownTargetPos = nil
+		clearChaseNodePlan(brain)
+		brain.RouteHoldUntil = nil
+		brain.RouteLastTarget = nil
+		brain.RouteLastMoveAt = nil
+		brain.LastChaseDoor = nil
+		brain.LastChaseDoorAt = nil
+	elseif newState == "ATTACK" then
+		Pathfinder:Stop(npc)
+		brain.AttackStartedAt = tick()
+		brain.AttackDamageDone = false
+	end
+end
+
+local function setState(npc, brain, newState, target)
+	if brain:SetState(newState, target) then
+		onStateEntered(npc, brain, newState)
+	end
+end
+
+local function forceRoam(npc, brain)
+	cleanupReeceSpray(npc, brain, false)
+	brain.Target = nil
+	brain.TargetLostAt = nil
+	brain.LostTargetAt = nil
+	brain.LastChaseTargetPos = nil
+	brain.LastChaseRepath = nil
+	brain.LastDirectMoveAt = nil
+	brain.LastChaseSteerAt = nil
+	brain.LastPathStuckAt = nil
+	brain.LastPathSamplePos = nil
+	brain.LastPathSampleAt = nil
+	brain.LastSeenTargetAt = nil
+	brain.LastKnownTargetPos = nil
+	brain.ChaseMode = nil
+	brain.FarDirectLock = false
+	brain.LastChaseDoor = nil
+	brain.LastChaseDoorAt = nil
+	clearChaseNodePlan(brain)
+	setState(npc, brain, "ROAM", nil)
+end
+
+local function registerNpc(npc)
+	local root = npc:FindFirstChild("HumanoidRootPart")
+	if root then
+		root:SetNetworkOwner(nil)
+	end
+	brains[npc] = StateMachine.new(npc)
+	resetRouteState(brains[npc])
+end
+
+for _, npc in ipairs(NPC_FOLDER:GetChildren()) do
+	registerNpc(npc)
+end
+for _, npc in ipairs(SPECIAL_NPC_FOLDER:GetChildren()) do
+	registerNpc(npc)
+end
+
+NPC_FOLDER.ChildAdded:Connect(registerNpc)
+SPECIAL_NPC_FOLDER.ChildAdded:Connect(registerNpc)
+
+local function removeNpc(npc)
+	cleanupReeceSpray(npc, brains[npc], false)
+	if brains[npc] then
+		clearChaseNodePlan(brains[npc])
+	end
+	brains[npc] = nil
+	npcAnimationSignatures[npc] = nil
+	npcVoiceState[npc] = nil
+	stopAllTracks(npcAnimations[npc])
+	npcAnimations[npc] = nil
+	Pathfinder:Stop(npc)
+end
+
+NPC_FOLDER.ChildRemoved:Connect(removeNpc)
+SPECIAL_NPC_FOLDER.ChildRemoved:Connect(removeNpc)
+
+local function isBrickStunned(npc)
+	local stunnedUntil = npc:GetAttribute("BrickStunnedUntil")
+	if typeof(stunnedUntil) ~= "number" then
+		return false
+	end
+	if tick() >= stunnedUntil then
+		npc:SetAttribute("BrickStunnedUntil", nil)
+		return false
+	end
+	return true
+end
+
+local function isSunStunned(npc)
+	local stunnedUntil = npc:GetAttribute("SunStunnedUntil")
+	if typeof(stunnedUntil) ~= "number" then
+		return false
+	end
+	if tick() >= stunnedUntil then
+		npc:SetAttribute("SunStunnedUntil", nil)
+		return false
+	end
+	return true
+end
+
+local function refreshRouteCache(npc, brain, rootPosition)
+	local patrolRouteId = npc:GetAttribute("PatrolRoute#")
+		or npc:GetAttribute("PatrolRoute")
+		or npc:GetAttribute("Route")
+	if patrolRouteId == nil then
+		return false
+	end
+
+	local expectedRouteName = tostring(patrolRouteId)
+	if brain.RouteName == expectedRouteName and brain.RoutePoints and #brain.RoutePoints > 0 then
+		return true
+	end
+
+	local points = Patrol:GetRoutePoints(patrolRouteId)
+	if #points == 0 then
+		resetRouteState(brain)
+		return false
+	end
+
+	brain.RouteName = expectedRouteName
+	brain.RoutePoints = points
+	brain.RouteDirection = 1
+	brain.RouteIndex = 1
+	brain.RouteHoldUntil = nil
+	brain.RouteLastTarget = nil
+	brain.RouteLastMoveAt = nil
+	brain.LastRoamDistance = nil
+	brain.LastRoamProgressAt = nil
+	return true
+end
+
+local function advanceRouteIndex(brain)
+	local points = brain.RoutePoints
+	if not points or #points <= 1 then
+		brain.RouteIndex = 1
+		return
+	end
+
+	local nextIndex = (brain.RouteIndex or 1) + (brain.RouteDirection or 1)
+	if nextIndex > #points then
+		brain.RouteDirection = -1
+		nextIndex = #points - 1
+	elseif nextIndex < 1 then
+		brain.RouteDirection = 1
+		nextIndex = 2
+	end
+
+	brain.RouteIndex = math.clamp(nextIndex, 1, #points)
+end
+
+local function routePointAllowsSmoothHandoff(pointInfo)
+	if not pointInfo or pointInfo.Type == "HOLD" then
+		return false
+	end
+
+	local part = pointInfo.Part
+	if not part or not part.Parent then
+		return false
+	end
+
+	return part:GetAttribute("DoorInteract") ~= true
+end
+
+local function startRouteMove(npc, brain, fromPosition, targetPart, options)
+	if not targetPart or not targetPart.Parent then
+		return false
+	end
+
+	local targetPos = targetPart.Position
+	Pathfinder:MoveTo(npc, targetPos, options)
+	brain.RouteLastTarget = targetPart
+	brain.RouteLastMoveAt = tick()
+	brain.LastRoamDistance = fromPosition and (fromPosition - targetPos).Magnitude or nil
+	brain.LastRoamProgressAt = tick()
+	return true
+end
+
+local function handoffToNextRoutePoint(npc, brain, fromPosition, options)
+	advanceRouteIndex(brain)
+	brain.RouteLastTarget = nil
+	brain.RouteLastMoveAt = nil
+
+	local nextPointInfo = brain.RoutePoints and brain.RoutePoints[brain.RouteIndex or 1]
+	if not nextPointInfo or not nextPointInfo.Part or not nextPointInfo.Part.Parent then
+		return false
+	end
+
+	return startRouteMove(npc, brain, fromPosition, nextPointInfo.Part, options)
+end
+
+local function updateChaseState(npc, brain, humanoid, root, anims, aggro, baseSpeed, alertMult, maxChaseSpeed, chaseMemory, attackRange)
+	local target = brain.Target
+	local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
+	local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
+
+	if not isLivePlayerCharacter(target) or isTargetDeadOrStale(target, targetHumanoid, targetRoot) then
+		forceRoam(npc, brain)
+		return
+	end
+
+	if not targetRoot or not targetHumanoid then
+		brain.TargetLostAt = brain.TargetLostAt or tick()
+		if tick() - brain.TargetLostAt >= TARGET_LOST_GRACE then
+			forceRoam(npc, brain)
+		end
+		return
+	end
+	brain.TargetLostAt = nil
+
+	local now = tick()
+	local chaseAim = targetRoot.Position
+	local distance = (chaseAim - root.Position).Magnitude
+	local nodeChaseDistance = tonumber(getAttr(npc, "NodeChaseDistance")) or CHASE_NODE_DISTANCE
+	local nodeCaptureRadius = tonumber(getAttr(npc, "NodeCaptureRadius", "ChaseNodeCaptureRadius")) or CHASE_NODE_CAPTURE_RADIUS
+	local nodeReachedDistance = tonumber(getAttr(npc, "NodeReachedDistance", "ChaseNodeReachedDistance")) or CHASE_NODE_TARGET_REACHED
+	local lastKnownReachedDistance = tonumber(getAttr(npc, "LastKnownReachedDistance", "ChaseLastKnownReachedDistance")) or CHASE_LAST_KNOWN_REACHED
+	local engageRange = attackRange
+	if isReeceSprayer(npc) then
+		engageRange = tonumber(getAttr(npc, "SprayGrabRange", "GrabRange", "SprayRange")) or attackRange
+	end
+	if distance <= engageRange + ATTACK_ENTER_BUFFER then
+		setState(npc, brain, "ATTACK", target)
+		return
+	end
+
+	local desiredChaseSpeed = math.min(baseSpeed * alertMult, maxChaseSpeed)
+	smoothSetWalkSpeed(humanoid, desiredChaseSpeed)
+
+	local hasLos = hasLineOfSight(root.Position, chaseAim, npc, target)
+	if hasLos then
+		brain.LastSeenTargetAt = now
+		brain.LastKnownTargetPos = chaseAim
+	else
+		brain.LastSeenTargetAt = brain.LastSeenTargetAt or now
+		brain.LastKnownTargetPos = brain.LastKnownTargetPos or chaseAim
+	end
+
+	local aggroDropDistance = aggro * CHASE_DROP_AGGRO_BUFFER
+	local lostSightDuration = hasLos and 0 or (now - (brain.LastSeenTargetAt or now))
+	local searchingLastKnown = (not hasLos)
+		and brain.LastKnownTargetPos ~= nil
+		and lostSightDuration >= chaseMemory
+	local pursuitGoal = searchingLastKnown and brain.LastKnownTargetPos or chaseAim
+	tryOpenChaseDoor(npc, brain, pursuitGoal)
+
+	if searchingLastKnown and brain.LastKnownTargetPos and (root.Position - brain.LastKnownTargetPos).Magnitude <= lastKnownReachedDistance then
+		forceRoam(npc, brain)
+		return
+	elseif not hasLos and distance > aggroDropDistance and brain.LastKnownTargetPos == nil then
+		forceRoam(npc, brain)
+		return
+	end
+
+	local chaseNodeAccess = npc:GetAttribute("ChaseNodeAccess") == true
+	local useNodeChase = chaseNodeAccess and (pursuitGoal - root.Position).Magnitude >= nodeChaseDistance
+	if useNodeChase then
+		useNodeChase = refreshChaseNodePlan(brain, root.Position, pursuitGoal, nodeCaptureRadius, nodeReachedDistance)
+	else
+		clearChaseNodePlan(brain)
+	end
+
+	if not brain.ChaseMode then
+		brain.ChaseMode = (distance <= CHASE_DIRECT_ENTER and hasLos and not useNodeChase) and "DIRECT" or "PATH"
+		brain.LastChaseModeSwitchAt = now
+	end
+
+	local canSwitchMode = not brain.LastChaseModeSwitchAt
+		or now - brain.LastChaseModeSwitchAt >= CHASE_MODE_LOCK_TIME
+	if canSwitchMode and brain.ChaseMode == "DIRECT" and (distance >= CHASE_DIRECT_EXIT or not hasLos or useNodeChase) then
+		Pathfinder:Stop(npc)
+		brain.ChaseMode = "PATH"
+		brain.LastChaseModeSwitchAt = now
+		brain.LastChaseRepath = nil
+	elseif canSwitchMode and brain.ChaseMode == "PATH" and distance <= CHASE_DIRECT_ENTER and hasLos and not useNodeChase then
+		Pathfinder:Stop(npc)
+		brain.ChaseMode = "DIRECT"
+		brain.LastChaseModeSwitchAt = now
+		brain.LastDirectMoveAt = nil
+		clearChaseNodePlan(brain)
+	end
+
+	if brain.ChaseMode == "DIRECT" then
+		if not brain.LastDirectMoveAt or now - brain.LastDirectMoveAt >= CHASE_DIRECT_REFRESH then
+			brain.LastDirectMoveAt = now
+			humanoid:MoveTo(chaseAim)
+		end
+		brain.LastChaseTargetPos = chaseAim
+		clearChaseNodePlan(brain)
+		playTrack(brain, anims.Run)
+		return
+	end
+
+	local moveTarget = pursuitGoal
+	local followingNodes = false
+	if useNodeChase then
+		moveTarget, followingNodes = getChaseMoveTarget(brain, root.Position, pursuitGoal, nodeReachedDistance)
+	else
+		clearChaseNodePlan(brain)
+	end
+
+	local moveDistance = (moveTarget - root.Position).Magnitude
+	local isFarChase = moveDistance >= CHASE_FAR_DISTANCE or followingNodes
+	local repathRate = isFarChase and CHASE_FAR_REPATH_RATE or CHASE_REPATH_RATE
+	local repathDistance = isFarChase and CHASE_FAR_REPATH_DISTANCE or CHASE_REPATH_DISTANCE
+
+	if followingNodes then
+		repathRate = math.min(repathRate, 0.25)
+		repathDistance = math.min(repathDistance, 2)
+	elseif not hasLos then
+		if isFarChase then
+			repathRate = math.max(repathRate, 0.5)
+			repathDistance = math.max(repathDistance, 4)
+		else
+			repathRate = math.min(repathRate, 0.2)
+			repathDistance = math.min(repathDistance, 1)
+		end
+	end
+
+	local toTarget = moveTarget - root.Position
+	local flatToTarget = Vector3.new(toTarget.X, 0, toTarget.Z)
+	local movingDir = humanoid.MoveDirection
+	local canUseWrongWayReset = (not isFarChase) and hasLos and distance <= CHASE_DIRECT_EXIT and not followingNodes
+	if canUseWrongWayReset and movingDir.Magnitude > 0.1 and flatToTarget.Magnitude > 1 then
+		local alignment = movingDir.Unit:Dot(flatToTarget.Unit)
+		if alignment < CHASE_WRONG_WAY_DOT then
+			if not brain.LastWrongWayRepathAt or now - brain.LastWrongWayRepathAt >= CHASE_WRONG_WAY_REPATH_COOLDOWN then
+				brain.LastWrongWayRepathAt = now
+				Pathfinder:Stop(npc)
+				brain.LastChaseRepath = nil
+				brain.LastChaseTargetPos = nil
+			end
+		end
+	end
+
+	if not brain.LastPathSamplePos then
+		brain.LastPathSamplePos = root.Position
+		brain.LastPathSampleAt = now
+	elseif now - (brain.LastPathSampleAt or now) >= CHASE_PATH_PROGRESS_SAMPLE then
+		local moved = (root.Position - brain.LastPathSamplePos).Magnitude
+		if moved < CHASE_PATH_PROGRESS_MIN then
+			brain.LastPathStuckAt = brain.LastPathStuckAt or now
+		else
+			brain.LastPathStuckAt = nil
+		end
+		brain.LastPathSamplePos = root.Position
+		brain.LastPathSampleAt = now
+	end
+
+	if brain.LastPathStuckAt and now - brain.LastPathStuckAt > 0.8 then
+		Pathfinder:Stop(npc)
+		brain.LastChaseRepath = nil
+		brain.LastChaseTargetPos = nil
+		brain.LastPathStuckAt = nil
+		brain.LastPathSamplePos = root.Position
+		brain.LastPathSampleAt = now
+		if useNodeChase then
+			refreshChaseNodePlan(brain, root.Position, pursuitGoal, nodeCaptureRadius, nodeReachedDistance)
+		end
+	end
+
+	if not brain.LastChaseRepath or now - brain.LastChaseRepath >= repathRate then
+		local shouldRepath = true
+		if brain.LastChaseTargetPos then
+			shouldRepath = (moveTarget - brain.LastChaseTargetPos).Magnitude >= repathDistance
+		end
+		if followingNodes then
+			shouldRepath = shouldRepath or brain.LastChaseTargetPos == nil
+		elseif not hasLos then
+			shouldRepath = true
+		end
+		if shouldRepath then
+			brain.LastChaseRepath = now
+			brain.LastChaseTargetPos = moveTarget
+			Pathfinder:MoveTo(npc, moveTarget, {
+				minRepathTime = repathRate,
+				minRepathDistance = repathDistance,
+				waypointTimeout = followingNodes and 1.5 or 1.1,
+			})
+		end
+	end
+
+	playTrack(brain, anims.Run)
+end
+
+while true do
+	task.wait(AGGRO_CHECK_RATE)
+
+	local chasedPlayers = {}
+
+	for npc, brain in pairs(brains) do
+		if not npc.Parent then
+			continue
+		end
+
+		local humanoid = npc:FindFirstChildOfClass("Humanoid")
+		local root = npc:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not root or humanoid.Health <= 0 then
+			continue
+		end
+
+		local currentAnimSignature = animationSignature(npc)
+		if not npcAnimations[npc] or npcAnimationSignatures[npc] ~= currentAnimSignature then
+			stopAllTracks(npcAnimations[npc])
+			npcAnimations[npc] = loadAnimations(npc, humanoid)
+			npcAnimationSignatures[npc] = currentAnimSignature
+			brain.CurrentPlayingAnim = nil
+		end
+		local anims = npcAnimations[npc]
+
+		tryPlayAmbientVoice(npc, brain, tick())
+
+		local brickStunned = isBrickStunned(npc)
+		local sunStunned = isSunStunned(npc)
+
+		if brickStunned or sunStunned then
+			Pathfinder:Stop(npc)
+			humanoid.WalkSpeed = 0
+
+			if sunStunned and anims.StunLoop then
+				playTrack(brain, anims.StunLoop)
+			elseif brickStunned and anims.BrickStun then
+				playTrack(brain, anims.BrickStun)
+			else
+				playTrack(brain, anims.Idle)
+			end
+
+			continue
+		end
+
+		if isSpecialNpc(npc) and npc:GetAttribute("SpawnDoorLocked") == true then
+			Pathfinder:Stop(npc)
+			humanoid.WalkSpeed = 0
+			playTrack(brain, anims.Idle)
+			continue
+		end
+
+		if isSpecialNpc(npc) and npc:GetAttribute("SpawnExitedAirlock") ~= true then
+			local spawnName = npc:GetAttribute("SpawnAirlockName")
+			local spawnAirlock = findAirlockByName(spawnName)
+			local spawnMarker = spawnAirlock and spawnAirlock:FindFirstChild("SpecialNPCSpawn")
+			if spawnMarker and (root.Position - spawnMarker.Position).Magnitude < SPECIAL_SPAWN_EXIT_DISTANCE then
+				local target = pickSpecialRoamTarget(npc, brain, root.Position)
+				smoothSetWalkSpeed(humanoid, getAttr(npc, "WalkSpeedBase") or 10)
+				Pathfinder:MoveTo(npc, target, {
+					minRepathTime = 0.35,
+					minRepathDistance = 1,
+					waypointTimeout = 1.6,
+				})
+				playTrack(brain, anims.Walk)
+				continue
+			end
+			npc:SetAttribute("SpawnExitedAirlock", true)
+		end
+
+		if isSpecialNpc(npc) and npc:GetAttribute("ReturningToAirlock") == true then
+			local designatedName = npc:GetAttribute("ReturnAirlockName")
+			local airlock = findAirlockByName(designatedName) or brain.ReturnAirlock
+			if not airlock or not airlock.Parent then
+				airlock = findNearestAirlock(root.Position)
+			end
+			brain.ReturnAirlock = airlock
+
+			if not airlock then
+				Pathfinder:Stop(npc)
+				humanoid.WalkSpeed = 0
+				playTrack(brain, anims.Idle)
+				continue
+			end
+
+			local waitMarker = airlock:FindFirstChild("NPCReturn")
+			local spawnMarker = airlock:FindFirstChild("SpecialNPCSpawn")
+			local phase = npc:GetAttribute("ReturnPhase") or "MOVE_TO_WAIT"
+
+			if phase == "MOVE_TO_WAIT" and waitMarker and waitMarker:IsA("BasePart") then
+				smoothSetWalkSpeed(humanoid, getAttr(npc, "WalkSpeedBase") or 10)
+				Pathfinder:MoveTo(npc, waitMarker.Position, {
+					minRepathTime = 0.45,
+					minRepathDistance = 1,
+					waypointTimeout = 1.8,
+				})
+				playTrack(brain, anims.Walk)
+				if (root.Position - waitMarker.Position).Magnitude <= AIRLOCK_TARGET_REACHED then
+					npc:SetAttribute("ReturnAtWaitPoint", true)
+					npc:SetAttribute("ReturnPhase", "WAIT_FOR_DOOR")
+					Pathfinder:Stop(npc)
+				end
+				continue
+			end
+
+			if phase == "WAIT_FOR_DOOR" then
+				Pathfinder:Stop(npc)
+				humanoid.WalkSpeed = 0
+				playTrack(brain, anims.Idle)
+				if isDoorOpen(airlock) then
+					npc:SetAttribute("ReturnPhase", "MOVE_INSIDE")
+				end
+				continue
+			end
+
+			if not spawnMarker or not spawnMarker:IsA("BasePart") then
+				Pathfinder:Stop(npc)
+				humanoid.WalkSpeed = 0
+				playTrack(brain, anims.Idle)
+				continue
+			end
+
+			smoothSetWalkSpeed(humanoid, getAttr(npc, "WalkSpeedBase") or 10)
+			Pathfinder:MoveTo(npc, spawnMarker.Position, {
+				minRepathTime = 0.4,
+				minRepathDistance = 1,
+				waypointTimeout = 1.7,
+			})
+			if (root.Position - spawnMarker.Position).Magnitude <= AIRLOCK_TARGET_REACHED then
+				npc:SetAttribute("SpecialInsideAirlock", true)
+				npc:SetAttribute("ReturnPhase", "INSIDE")
+				Pathfinder:Stop(npc)
+				humanoid.WalkSpeed = 0
+				playTrack(brain, anims.Idle)
+			else
+				playTrack(brain, anims.Walk)
+			end
+			continue
+		end
+
+		local regionInfo = WorldQuery:GetRegionInfo(root.Position)
+		local aggro = (getAttr(npc, "AggroRange") or 30) * regionInfo.AggroMult
+		local baseSpeed = (getAttr(npc, "WalkSpeedBase") or 10) * regionInfo.SpeedMult
+		local alertMult = getAttr(npc, "AlertSpeedMult") or 1.35
+		local maxChaseSpeed = getAttr(npc, "MaxChaseSpeed") or 13
+		local chaseMemory = getAttr(npc, "ChaseMemory") or 2
+		local attackRange = getAttr(npc, "AttackRange") or 4
+		local damage = getAttr(npc, "Damage") or 10
+		local cooldown = getAttr(npc, "AttackCooldown") or 1.2
+		local attackHitDelay = getAttr(npc, "AttackHitDelay") or 0.2
+
+		local nearestPlayer, nearestDistance = getNearestPlayer(root.Position)
+		if brain.State == "ROAM" and nearestPlayer and nearestDistance <= aggro then
+			setState(npc, brain, "CHASE", nearestPlayer)
+			playAlertVoice(npc, tick())
+		end
+
+		if brain.State == "ROAM" then
+			if isSpecialNpc(npc) then
+				if brain.RoamPauseUntil and tick() < brain.RoamPauseUntil then
+					Pathfinder:Stop(npc)
+					smoothSetWalkSpeed(humanoid, 0)
+					playTrack(brain, anims.Idle)
+					continue
+				end
+
+				if not brain.RoamTarget then
+					brain.RoamTarget = pickSpecialRoamTarget(npc, brain, root.Position)
+					brain.LastRoamDistance = (root.Position - brain.RoamTarget).Magnitude
+					brain.LastRoamProgressAt = tick()
+					Pathfinder:MoveTo(npc, brain.RoamTarget, {
+						minRepathTime = 0.6,
+						minRepathDistance = 1,
+						waypointTimeout = 2.0,
+					})
+				end
+
+				smoothSetWalkSpeed(humanoid, baseSpeed)
+				local remaining = (root.Position - brain.RoamTarget).Magnitude
+				if remaining <= ROUTE_TARGET_REACHED then
+					brain.RoamTarget = nil
+					brain.RoamPauseUntil = randomIdlePauseUntil(npc)
+				elseif not brain.LastRoamDistance or remaining < brain.LastRoamDistance - ROAM_PROGRESS_DELTA then
+					brain.LastRoamDistance = remaining
+					brain.LastRoamProgressAt = tick()
+				elseif brain.LastRoamProgressAt and tick() - brain.LastRoamProgressAt >= ROAM_STUCK_SECONDS then
+					brain.RoamTarget = nil
+					brain.RoamPauseUntil = tick() + 0.5
+					Pathfinder:Stop(npc)
+				end
+
+				local shouldWalk = brain.RoamTarget ~= nil and remaining > (ROUTE_TARGET_REACHED + 0.5)
+				if shouldWalk then
+					playTrack(brain, anims.Walk)
+				else
+					playTrack(brain, anims.Idle)
+				end
+			else
+				local hasRoute = refreshRouteCache(npc, brain, root.Position)
+				if not hasRoute then
+					if not brain.RoamTarget then
+						brain.RoamTarget = pickRoamTargetInRegion(npc, root.Position, WorldQuery:GetRegionInfo(root.Position).Part)
+						brain.LastRoamDistance = (root.Position - brain.RoamTarget).Magnitude
+						brain.LastRoamProgressAt = tick()
+						Pathfinder:MoveTo(npc, brain.RoamTarget, {
+							minRepathTime = 0.6,
+							minRepathDistance = 1,
+							waypointTimeout = 2.0,
+						})
+					end
+
+					local roamRemaining = (root.Position - brain.RoamTarget).Magnitude
+					if roamRemaining <= ROUTE_TARGET_REACHED then
+						brain.RoamTarget = nil
+					elseif not brain.LastRoamDistance or roamRemaining < brain.LastRoamDistance - ROAM_PROGRESS_DELTA then
+						brain.LastRoamDistance = roamRemaining
+						brain.LastRoamProgressAt = tick()
+					elseif brain.LastRoamProgressAt and tick() - brain.LastRoamProgressAt >= ROAM_STUCK_SECONDS then
+						brain.RoamTarget = nil
+						Pathfinder:Stop(npc)
+					end
+
+					smoothSetWalkSpeed(humanoid, baseSpeed)
+					if brain.RoamTarget then
+						playTrack(brain, anims.Walk)
+					else
+						playTrack(brain, anims.Idle)
+					end
+					continue
+				end
+
+				local pointInfo = brain.RoutePoints[brain.RouteIndex or 1]
+				if not pointInfo or not pointInfo.Part or not pointInfo.Part.Parent then
+					brain.RoutePoints = nil
+					brain.RouteName = nil
+					continue
+				end
+
+				if brain.RouteHoldUntil and tick() < brain.RouteHoldUntil then
+					Pathfinder:Stop(npc)
+					smoothSetWalkSpeed(humanoid, 0)
+					playTrack(brain, anims.Idle)
+					continue
+				end
+				brain.RouteHoldUntil = nil
+
+				local routeMoveOptions = {
+					minRepathTime = 0.4,
+					minRepathDistance = 0.8,
+					waypointTimeout = 1.8,
+				}
+				local targetPos = pointInfo.Part.Position
+				local shouldRefreshMove = not brain.RouteLastMoveAt
+				if brain.RouteLastTarget ~= pointInfo.Part or shouldRefreshMove then
+					startRouteMove(npc, brain, root.Position, pointInfo.Part, routeMoveOptions)
+				end
+
+				smoothSetWalkSpeed(humanoid, baseSpeed)
+				local remaining = (root.Position - targetPos).Magnitude
+				local canSmoothHandoff = routePointAllowsSmoothHandoff(pointInfo)
+					and remaining <= ROUTE_NODE_HANDOFF_DISTANCE
+					and brain.RoutePoints
+					and #brain.RoutePoints > 1
+				if canSmoothHandoff then
+					handoffToNextRoutePoint(npc, brain, root.Position, routeMoveOptions)
+					playTrack(brain, anims.Walk)
+					continue
+				end
+				if remaining <= ROUTE_TARGET_REACHED then
+					local holdUntil = brain.RouteHoldUntil
+					local pointPart = pointInfo.Part
+
+					if pointPart:GetAttribute("DoorInteract") == true then
+						local doorId = pointPart:GetAttribute("DoorId")
+						local waitTime = tonumber(pointPart:GetAttribute("DoorWaitTime")) or 0.35
+						local doorModel = findDoorById(doorId)
+
+						if doorModel and doorModel:GetAttribute("NPCInteract") ~= false then
+							Pathfinder:Stop(npc)
+							humanoid:MoveTo(root.Position)
+
+							if anims.DoorOpen then
+								playTrack(brain, anims.DoorOpen)
+							else
+								playTrack(brain, anims.Idle)
+							end
+
+							pcall(function()
+								NPCDoorRequest:Invoke(doorModel, npc, false, nil)
+							end)
+
+							local doorHoldUntil = tick() + waitTime
+							holdUntil = holdUntil and math.max(holdUntil, doorHoldUntil) or doorHoldUntil
+						end
+					end
+
+					if pointInfo.Type == "HOLD" then
+						local holdTime = tonumber(pointInfo.HoldTime) or 0
+						if holdTime > 0 then
+							local nodeHoldUntil = tick() + holdTime
+							holdUntil = holdUntil and math.max(holdUntil, nodeHoldUntil) or nodeHoldUntil
+						end
+					end
+
+					brain.RouteHoldUntil = holdUntil
+
+					if brain.RouteHoldUntil then
+						advanceRouteIndex(brain)
+						brain.RouteLastTarget = nil
+						brain.RouteLastMoveAt = nil
+						Pathfinder:Stop(npc)
+					else
+						handoffToNextRoutePoint(npc, brain, root.Position, routeMoveOptions)
+					end
+				elseif not brain.LastRoamDistance or remaining < brain.LastRoamDistance - ROAM_PROGRESS_DELTA then
+					brain.LastRoamDistance = remaining
+					brain.LastRoamProgressAt = tick()
+				elseif brain.LastRoamProgressAt and tick() - brain.LastRoamProgressAt >= ROAM_STUCK_SECONDS then
+					brain.RouteLastTarget = nil
+					brain.RouteLastMoveAt = nil
+					brain.LastRoamProgressAt = tick()
+					Pathfinder:Stop(npc)
+				end
+
+				if brain.RouteHoldUntil then
+					playTrack(brain, anims.Idle)
+				else
+					playTrack(brain, anims.Walk)
+				end
+			end
+
+		elseif brain.State == "CHASE" then
+			local target = brain.Target
+			local targetPlayer = target and Players:GetPlayerFromCharacter(target)
+			if targetPlayer then
+				chasedPlayers[targetPlayer] = true
+			end
+			updateChaseState(npc, brain, humanoid, root, anims, aggro, baseSpeed, alertMult, maxChaseSpeed, chaseMemory, attackRange)
+
+		elseif brain.State == "ATTACK" then
+			local target = brain.Target
+			local targetPlayer = target and Players:GetPlayerFromCharacter(target)
+			if targetPlayer then
+				chasedPlayers[targetPlayer] = true
+			end
+			local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
+			local targetHumanoid = target and target:FindFirstChildOfClass("Humanoid")
+
+			if not isLivePlayerCharacter(target) or isTargetDeadOrStale(target, targetHumanoid, targetRoot) then
+				forceRoam(npc, brain)
+				continue
+			end
+
+			if not targetRoot or not targetHumanoid then
+				brain.TargetLostAt = brain.TargetLostAt or tick()
+				if tick() - brain.TargetLostAt >= TARGET_LOST_GRACE then
+					forceRoam(npc, brain)
+				end
+				continue
+			end
+			brain.TargetLostAt = nil
+
+			local distance = (targetRoot.Position - root.Position).Magnitude
+			local holdRange = attackRange
+			if isReeceSprayer(npc) then
+				holdRange = tonumber(getAttr(npc, "SprayGrabRange", "GrabRange", "SprayRange")) or attackRange
+			end
+			if distance > holdRange + ATTACK_EXIT_BUFFER then
+				setState(npc, brain, "CHASE", target)
+				continue
+			end
+
+			humanoid.WalkSpeed = 0
+			Pathfinder:Stop(npc)
+
+			local now = tick()
+			if isReeceSprayer(npc) then
+				local sprayTrack = anims.Spray or anims.Attack
+				if sprayTrack then
+					playTrack(brain, sprayTrack)
+				end
+
+				local gasStartDelay = tonumber(getAttr(npc, "GasStartDelay", "SprayStartDelay")) or 0
+				local grabDistance = tonumber(getAttr(npc, "SprayGrabDistance", "GrabDistance")) or 2.5
+
+				if not brain.ReeceSprayActive then
+					brain.ReeceSprayActive = true
+					brain.ReeceVictimHumanoid = targetHumanoid
+					brain.ReeceVictimCharacter = target
+					local victimRoot = target:FindFirstChild("HumanoidRootPart")
+					brain.ReeceVictimState = {
+						walkSpeed = targetHumanoid.WalkSpeed,
+						jumpPower = targetHumanoid.JumpPower,
+						jumpHeight = targetHumanoid.JumpHeight,
+						useJumpPower = targetHumanoid.UseJumpPower,
+						autoRotate = targetHumanoid.AutoRotate,
+						platformStand = targetHumanoid.PlatformStand,
+						rootAnchored = victimRoot and victimRoot.Anchored or false,
+					}
+
+					targetHumanoid.WalkSpeed = 0
+					targetHumanoid.AutoRotate = false
+					targetHumanoid.PlatformStand = true
+					if targetHumanoid.UseJumpPower then
+						targetHumanoid.JumpPower = 0
+					else
+						targetHumanoid.JumpHeight = 0
+					end
+					if victimRoot then
+						victimRoot.Anchored = true
+						victimRoot.AssemblyLinearVelocity = Vector3.zero
+						victimRoot.AssemblyAngularVelocity = Vector3.zero
+					end
+
+					local sprayDuration = tonumber(getAttr(npc, "SprayDuration"))
+						or (sprayTrack and sprayTrack.Length and sprayTrack.Length > 0 and sprayTrack.Length)
+						or 2.5
+					brain.ReeceSprayStartsAt = now + math.max(0, gasStartDelay)
+					brain.ReeceSprayEndsAt = brain.ReeceSprayStartsAt + sprayDuration
+					brain.ReeceGasEnabled = false
+					setReeceGasEnabled(npc, false)
+				end
+
+				if root and targetRoot then
+					local lookAtTarget = Vector3.new(targetRoot.Position.X, root.Position.Y, targetRoot.Position.Z)
+					root.CFrame = CFrame.lookAt(root.Position, lookAtTarget)
+					local desiredTargetPos = root.Position + (root.CFrame.LookVector * math.max(1.25, grabDistance))
+					desiredTargetPos = Vector3.new(desiredTargetPos.X, targetRoot.Position.Y, desiredTargetPos.Z)
+					targetRoot.CFrame = CFrame.lookAt(desiredTargetPos, root.Position)
+					targetRoot.AssemblyLinearVelocity = Vector3.zero
+					targetRoot.AssemblyAngularVelocity = Vector3.zero
+				end
+
+				if not brain.ReeceGasEnabled and now >= (brain.ReeceSprayStartsAt or now) then
+					setReeceGasEnabled(npc, true)
+					brain.ReeceGasEnabled = true
+				end
+
+				if now >= (brain.ReeceSprayEndsAt or now) then
+					cleanupReeceSpray(npc, brain, true)
+					npc:SetAttribute("ReturningToAirlock", true)
+					npc:SetAttribute("SpecialInsideAirlock", false)
+					npc:SetAttribute("ReturnAtWaitPoint", false)
+					npc:SetAttribute("ReturnPhase", "MOVE_TO_WAIT")
+					if not npc:GetAttribute("ReturnAirlockName") and npc:GetAttribute("SpawnAirlockName") then
+						npc:SetAttribute("ReturnAirlockName", npc:GetAttribute("SpawnAirlockName"))
+					end
+					forceRoam(npc, brain)
+				end
+				continue
+			end
+
+			playTrack(brain, anims.Attack)
+			if not brain.AttackDamageDone and now - (brain.AttackStartedAt or now) >= attackHitDelay then
+				targetHumanoid:TakeDamage(damage)
+				playHitSfx(target)
+				if targetHumanoid.Health <= 0 or targetHumanoid:GetState() == Enum.HumanoidStateType.Dead then
+					brain.AttackDamageDone = true
+					brain.LastAttack = now
+					forceRoam(npc, brain)
+					continue
+				end
+				brain.AttackDamageDone = true
+				brain.LastAttack = now
+			end
+
+			if brain.AttackDamageDone and now - brain.LastAttack >= cooldown then
+				brain.AttackStartedAt = now
+				brain.AttackDamageDone = false
+				anims.Attack:Stop(0.05)
+				anims.Attack:Play(0.05)
+			end
+		end
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		setPlayerChaseActive(player, chasedPlayers[player] == true)
+	end
+
+	updatePlayerChaseAudio(AGGRO_CHECK_RATE)
+end
